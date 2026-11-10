@@ -1,5 +1,7 @@
 <h1 align="center">UniSuperMimic</h1>
 
+> **topmimic — PACE + adapted STAR:** This repository extends UniSuperMimic with second-stage hard-motion training and evaluation. See the [Chinese training guide](docs/pace_star_stage2_zh.md) and [GitHub/server sync guide](docs/server_sync_zh.md). Model weights, motion data and Python environments are not included in Git.
+
 <h3 align="center">SuperMimic reproduction on UniLab</h3>
 
 <p align="center">Languages: English | <a href="README_zh.md">简体中文</a></p>

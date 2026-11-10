@@ -2,8 +2,8 @@
 
 ## 代码与数据的位置
 
-- GitHub 目标仓库：`https://github.com/bv74238/topmimic.git`，本地远端名为 `topmimic`。
-- 本地：`/home/kevin/Uni-SuperMimic`，专用开发分支 `codex/pace-star`。
+- GitHub：`https://github.com/bv74238/topmimic.git`，本地远端名为 `topmimic`；默认分支 `main` 与开发分支 `codex/pace-star` 同步本轮代码。
+- 本地：`/home/kevin/Uni-SuperMimic`，当前开发分支 `codex/pace-star`。
 - SSH：`ssh -p 31069 root@183.147.142.40`。
 - 服务器部署目录：`/root/Uni-SuperMimic-pace-star`，分支 `codex/pace-star`。
 - 服务器独立裸仓库：`/root/Uni-SuperMimic-pace-star.git`，本地远端名为 `pace-server`。
@@ -12,28 +12,24 @@
 
 Git 只管理源码、配置、测试、文档与依赖清单/锁文件。**权重、run、输出、环境、缓存、动作/机器人数据及 ZIP 不进 Git**。它们保留在本地和服务器，不因代码同步删除。
 
-本次整理前已对比两端全部 69 个代码/文档文件，内容一致。GitHub 当前登录曾返回 401；只有推送命令成功后才表示 GitHub 同步完成，不能把新增远端当成已上传。
+同步前已对比两端全部 69 个代码/文档文件，内容一致。服务器原工作快照另外保存在 `git stash` 中以便追溯。本轮保留 GitHub 原 `main` 初始化提交并合并其历史，不强制推送或丢弃远端历史；README 保留项目说明并增加 topmimic 的 PACE/STAR 入口。
 
 ## 日常同步
-
-首次使用 GitHub 若认证失效，在本地终端重新登录，勿把访问令牌写进仓库或聊天：
-
-```bash
-gh auth login -h github.com
-gh auth setup-git
-```
 
 在本地审查并提交需要同步的代码，然后推送同一个提交到 GitHub 和服务器中转仓库：
 
 ```bash
 cd /home/kevin/Uni-SuperMimic
 git status --short
-# 先按文件审查、git add 并 git commit，不要强制添加被忽略的大文件。
-git push topmimic HEAD:codex/pace-star
+# 先在干净工作区同步 GitHub 可能新增的提交，禁止强行覆盖。
+git fetch topmimic
+git merge --ff-only topmimic/main
+# 修改后按文件审查、git add 并 git commit，不要强制添加被忽略的大文件。
+git push --atomic topmimic HEAD:main HEAD:codex/pace-star
 git push pace-server HEAD:codex/pace-star
 ```
 
-这是独立分支，不强推或覆盖目标仓库已有 `main`。若要把代码并入 GitHub 的默认分支，在 GitHub 审查并合并相应分支；已有历史不一致时不要使用强推。
+若远端存在未合并变更，上述命令会拒绝非快进更新；先审查合并，不要使用 `--force`。若需要发起代码审查，可先只推开发分支，再通过 GitHub 合并到 `main`，最后将最终合并提交同步至本地及服务器。
 
 服务器收到推送后更新部署目录：
 
@@ -47,7 +43,14 @@ export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 .venv/bin/python -m unisupermimic.scripts.pace --help
 ```
 
-服务器通过裸仓库中转获取与 GitHub 相同的提交，无需把本机 GitHub 凭据或私钥复制到服务器。服务器也配置 `topmimic` 远端，若未来要直接从 GitHub 拉取，须确保服务器具备对应仓库的读取权限。
+服务器通过裸仓库中转获取与 GitHub 相同的提交，无需把本机 GitHub 凭据或私钥复制到服务器。服务器也配置 `topmimic` 远端；若直接读取公开仓库，可执行 `git fetch topmimic`，但部署更新仍以上述中转流程为准。
+
+Git 推送和 `gh` CLI 的登录状态可能不同；以实际 Git 推送结果为准。如果 Git 推送确实提示身份认证失败，可在本地重新登录（勿把令牌写进仓库或聊天）：
+
+```bash
+gh auth login -h github.com
+gh auth setup-git
+```
 
 ## 训练数据不走 Git
 

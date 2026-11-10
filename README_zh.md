@@ -1,5 +1,7 @@
 <h1 align="center">UniSuperMimic</h1>
 
+> **topmimic · PACE + STAR 适配版：** 本仓库在 UniSuperMimic 上增加高难动作第二阶段训练与评估。请参阅 [中文训练手册](docs/pace_star_stage2_zh.md) 和 [GitHub/服务器同步说明](docs/server_sync_zh.md)。Git 不包含权重、动作数据或 Python 环境。
+
 <h3 align="center">基于 UniLab 的 SuperMimic 复现</h3>
 
 <p align="center">语言：简体中文 | <a href="README.md">English</a></p>
