@@ -131,6 +131,18 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
   --ckpt runs/supermimic_mjwarp_001/ckpt_012000.pt
 ```
 
+To evaluate custom G1 CSVs using the same evaluator, pass `--motion`. Use `--output` to save the full JSON report, including per-clip results:
+
+```bash
+MUJOCO_GL=egl uv run unisupermimic-eval \
+  --backend mujoco \
+  --ckpt /home/kevin/Uni-SuperMimic/runs/supermimic_mjwarp_001/ckpt_012000.pt \
+  --motion /home/kevin/GMR/retargeted_motions/csv/tennis_g1.csv \
+  --output /home/kevin/Uni-SuperMimic/outputs/evaluations/tennis_g1_eval.json
+```
+
+Repeat `--motion` to evaluate multiple CSVs. Both `--motion` and `--output` require a single-checkpoint evaluation with `--ckpt`, not checkpoint watching, to keep custom-reference scores separate from training evaluation records. Standard output remains a summary; the saved report additionally includes each clip's `norm_return`, `steps`, and `failed` under `per_clip`. Reward and metric definitions are unchanged; no joint-angle or body-position error metrics are added.
+
 ## Video Export
 
 The following command rolls out `jumps1_subject1` continuously from a checkpoint, trims the result to the jumping segment from 6–14 seconds, and writes a 25 fps comparison MP4:
@@ -142,10 +154,23 @@ CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl uv run unisupermimic-video \
   --clip jumps1_subject1 \
   --start 6 \
   --seconds 8 \
-  --output docs/assets/supermimic_comparison.mp4
+  --output outputs/videos/supermimic_comparison.mp4
 ```
 
 By default, the reference root XY is aligned with the policy to highlight whole-body tracking. Pass `--global-ghost` to preserve the reference motion's global displacement.
+
+A custom G1 CSV exported by GMR can also be used as the reference. Each frame must contain root position, an `xyzw` quaternion, and 29 joint positions in this project's G1 natural joint order. A single clip defaults to the CSV basename; its source rate is read as 30 Hz by the task configuration:
+
+```bash
+MUJOCO_GL=egl uv run unisupermimic-video \
+  --backend mujoco \
+  --ckpt runs/supermimic_mjwarp_001/ckpt_012000.pt \
+  --motion /path/to/tennis_g1.csv \
+  --seconds 6 \
+  --output /tmp/tennis_g1_comparison.mp4
+```
+
+Custom motions replace only the inference-time reference list. The checkpoint, policy structure, and robot model are still checked against the training run before the custom references are loaded. Repeat `--motion` to load several CSVs, then select one with `--clip <csv-basename>`.
 
 ## Results
 

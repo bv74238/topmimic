@@ -86,6 +86,9 @@ env:
       entity_name: robot
       mjcf_path: src/unisupermimic/assets/robots/g1/supermimic.xml
       eval_mode: false
+      eval_initial_noise: false
+      motion_roles: null
+      acquisition_fraction: 0.8
       gamma: 0.99
       src_fps: 30.0
       reset_noise: true

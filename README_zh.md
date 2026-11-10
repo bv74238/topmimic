@@ -131,6 +131,18 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
   --ckpt runs/supermimic_mjwarp_001/ckpt_012000.pt
 ```
 
+评估自定义 G1 CSV 时，直接复用相同的评估逻辑，传入 `--motion`；用 `--output` 保存包含逐动作结果的完整 JSON 报告：
+
+```bash
+MUJOCO_GL=egl uv run unisupermimic-eval \
+  --backend mujoco \
+  --ckpt /home/kevin/Uni-SuperMimic/runs/supermimic_mjwarp_001/ckpt_012000.pt \
+  --motion /home/kevin/GMR/retargeted_motions/csv/tennis_g1.csv \
+  --output /home/kevin/Uni-SuperMimic/outputs/evaluations/tennis_g1_eval.json
+```
+
+可重复 `--motion` 评估多条 CSV。`--motion` 和 `--output` 仅用于指定 `--ckpt` 的单次评估，不用于监听训练目录，以免自定义动作结果混入原训练评估记录。终端仍输出汇总，JSON 报告额外包含 `per_clip` 中各动作的 `norm_return`、`steps` 和 `failed`。指标定义和奖励保持不变，未新增关节角/关键点误差指标。
+
 ## 视频导出
 
 以下命令从 checkpoint 连续采样 `jumps1_subject1`，截取第 6–14 秒的跳跃片段，生成 25 fps 的参考动作对比 MP4：
@@ -142,10 +154,23 @@ CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl uv run unisupermimic-video \
   --clip jumps1_subject1 \
   --start 6 \
   --seconds 8 \
-  --output docs/assets/supermimic_comparison.mp4
+  --output outputs/videos/supermimic_comparison.mp4
 ```
 
 默认将参考动作的 root XY 对齐策略，便于观察全身跟踪；传入 `--global-ghost` 可保留参考动作的全局位移。
+
+也可以使用 GMR 导出的自定义 G1 CSV。CSV 每帧需包含根部位置、`xyzw` 四元数和按本项目 G1 自然关节顺序排列的 29 个关节角；源帧率由动作配置按 30 Hz 读取。单个自定义动作的片段名默认为 CSV 文件名（不含扩展名）：
+
+```bash
+MUJOCO_GL=egl uv run unisupermimic-video \
+  --backend mujoco \
+  --ckpt runs/supermimic_mjwarp_001/ckpt_012000.pt \
+  --motion /home/kevin/GMR/retargeted_motions/csv/tennis_g1.csv \
+  --seconds 6 \
+  --output /tmp/tennis_g1_comparison.mp4
+```
+
+自定义动作只替换推理时的参考轨迹；程序仍会先按训练 run 配置严格检查 checkpoint、策略结构和机器人模型。多个 CSV 可重复传入 `--motion`，并用 `--clip` 选择文件名对应的片段。
 
 ## 结果
 

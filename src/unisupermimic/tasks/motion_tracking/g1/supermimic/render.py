@@ -234,11 +234,20 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backend", choices=SUPPORTED_BACKENDS, default="mjwarp", help="Simulation backend"
     )
-    parser.add_argument("--clip", default="dance1_subject1")
+    parser.add_argument(
+        "--motion",
+        type=Path,
+        action="append",
+        help="Custom G1 reference-motion CSV (repeat to load multiple clips)",
+    )
+    parser.add_argument(
+        "--clip",
+        help="Clip basename to render; defaults to the custom CSV basename or dance1_subject1",
+    )
     parser.add_argument("--seconds", type=float, default=8.0)
     parser.add_argument("--start", type=float, default=0.0)
     parser.add_argument(
-        "--output", type=Path, default=Path("docs/assets/supermimic_comparison.mp4")
+        "--output", type=Path, default=Path("outputs/videos/supermimic_comparison.mp4")
     )
     parser.add_argument("--scene", type=Path, default=DEFAULT_SCENE)
     parser.add_argument("--width", type=int, default=960)
@@ -252,7 +261,20 @@ def main(argv: list[str] | None = None) -> None:
     from unisupermimic.sim2sim import policy_load_dim_guard
 
     args = _argument_parser().parse_args(argv)
-    env = make_eval_env(args.ckpt.parent, backend=args.backend)
+    if args.motion:
+        clip_names = [path.stem for path in args.motion]
+        if len(clip_names) != len(set(clip_names)):
+            raise ValueError("Custom motion CSV files must have unique basenames")
+        if args.clip is None:
+            if len(clip_names) != 1:
+                raise ValueError("Specify --clip when loading more than one --motion CSV")
+            clip_name = clip_names[0]
+        else:
+            clip_name = args.clip
+        env = make_eval_env(args.ckpt.parent, backend=args.backend, motion_files=args.motion)
+    else:
+        clip_name = args.clip or "dance1_subject1"
+        env = make_eval_env(args.ckpt.parent, backend=args.backend)
     try:
         device = torch.device(env.device)
         checkpoint = torch.load(args.ckpt, map_location=device, weights_only=True)
@@ -262,14 +284,14 @@ def main(argv: list[str] | None = None) -> None:
             algo_name="supermimic",
         ):
             reference, policy = rollout_qpos(
-                env, checkpoint, args.clip, args.seconds, start=args.start
+                env, checkpoint, clip_name, args.seconds, start=args.start
             )
         written = render_comparison(
             reference,
             policy,
             args.output,
             args.scene,
-            clip_name=args.clip,
+            clip_name=clip_name,
             width=args.width,
             height=args.height,
             fps=args.fps,

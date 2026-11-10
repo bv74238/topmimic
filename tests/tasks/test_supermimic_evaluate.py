@@ -380,3 +380,121 @@ def test_eval_parser_accepts_backend(backend: str) -> None:
     )
 
     assert args.backend == backend
+
+
+def test_resolve_custom_motion_files_accepts_csv_and_resolves_path(tmp_path) -> None:
+    motion = tmp_path / "tennis_g1.csv"
+    row = "0,0,0,0,0,0,1," + ",".join(["0"] * 29)
+    motion.write_text(row + "\n" + row + "\n")
+
+    resolved = supermimic_evaluate._resolve_custom_motion_files([motion])
+
+    assert resolved == [motion.resolve()]
+
+
+def test_resolve_custom_motion_files_rejects_missing_and_duplicate_names(tmp_path) -> None:
+    missing = tmp_path / "missing.csv"
+    with pytest.raises(FileNotFoundError, match="missing.csv"):
+        supermimic_evaluate._resolve_custom_motion_files([missing])
+
+    first = tmp_path / "first" / "motion.csv"
+    second = tmp_path / "second" / "motion.csv"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.touch()
+    second.touch()
+    with pytest.raises(ValueError, match="unique basenames"):
+        supermimic_evaluate._resolve_custom_motion_files([first, second])
+
+
+def test_eval_parser_accepts_multiple_custom_motions_and_output(tmp_path) -> None:
+    first, second = tmp_path / "first.csv", tmp_path / "second.csv"
+    output = tmp_path / "reports" / "metrics.json"
+    args = supermimic_evaluate._argument_parser().parse_args(
+        [
+            "--ckpt",
+            "run/ckpt.pt",
+            "--motion",
+            str(first),
+            "--motion",
+            str(second),
+            "--output",
+            str(output),
+        ]
+    )
+    assert args.motion == [first, second]
+    assert args.output == output
+
+
+@pytest.mark.parametrize("option", ["--motion", "--output"])
+def test_eval_custom_options_require_checkpoint(monkeypatch, tmp_path, capsys, option) -> None:
+    monkeypatch.setattr(
+        supermimic_evaluate,
+        "make_eval_env",
+        lambda *args, **kwargs: pytest.fail("invalid arguments must not create an environment"),
+    )
+    with pytest.raises(SystemExit) as exc:
+        supermimic_evaluate.main(["--run_dir", str(tmp_path), option, "custom.csv"])
+    assert exc.value.code == 2
+    assert "require --ckpt" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("custom_motion", [False, True])
+@pytest.mark.parametrize("save_report", [False, True])
+def test_eval_main_reuses_evaluator_and_optionally_saves_full_report(
+    monkeypatch, tmp_path, capsys, custom_motion, save_report
+) -> None:
+    import unisupermimic.sim2sim as sim2sim
+
+    calls = {}
+    checkpoint = {"marker": "checkpoint"}
+    result = {
+        "norm_return": 0.7,
+        "norm_return_framew": 0.7,
+        "n_failed": 0,
+        "failed": [],
+        "per_clip": {"tennis_g1": {"norm_return": 0.7, "steps": 100, "failed": False}},
+    }
+    env = SimpleNamespace(
+        device="cpu",
+        supermimic_mdp=SimpleNamespace(obs_dim=158),
+        action_manager=SimpleNamespace(total_action_dim=29),
+        close=lambda: calls.update(env_closed=True),
+        backend=SimpleNamespace(close=lambda: calls.update(backend_closed=True)),
+    )
+
+    def fake_make_env(run_dir, backend, motion_files):
+        calls.update(run_dir=run_dir, backend=backend, motion_files=motion_files)
+        return env
+
+    def fake_evaluate(received_env, received_checkpoint, device=None):
+        assert received_env is env
+        assert received_checkpoint is checkpoint
+        assert device == torch.device("cpu")
+        calls["evaluated"] = True
+        return result
+
+    monkeypatch.setattr(supermimic_evaluate, "make_eval_env", fake_make_env)
+    monkeypatch.setattr(supermimic_evaluate, "evaluate", fake_evaluate)
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: checkpoint)
+    monkeypatch.setattr(sim2sim, "policy_load_dim_guard", lambda **kwargs: nullcontext())
+    ckpt = tmp_path / "ckpt_012000.pt"
+    motion = tmp_path / "tennis_g1.csv"
+    output = tmp_path / "outputs" / "evaluations" / "tennis_g1.json"
+    argv = ["--ckpt", str(ckpt), "--backend", "mujoco"]
+    if custom_motion:
+        argv += ["--motion", str(motion)]
+    if save_report:
+        argv += ["--output", str(output)]
+    supermimic_evaluate.main(argv)
+
+    assert calls["run_dir"] == tmp_path
+    assert calls["backend"] == "mujoco"
+    assert calls["motion_files"] == ([motion] if custom_motion else None)
+    assert calls["evaluated"] and calls["env_closed"] and calls["backend_closed"]
+    summary = json.loads(capsys.readouterr().out)
+    assert summary == {key: value for key, value in result.items() if key != "per_clip"}
+    if save_report:
+        assert json.loads(output.read_text()) == result
+    else:
+        assert not output.exists()

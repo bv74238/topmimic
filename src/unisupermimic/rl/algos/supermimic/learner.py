@@ -6,6 +6,7 @@ import json
 import math
 import os
 import time
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -26,6 +27,7 @@ from . import networks
 from .geometry import unflatten_state
 from .networks import Critic, Policy, WorldModel, mlp
 from .replay import ReplayBuffer
+from .stage2 import consolidation_weight, matching_critic, selected_fragments
 
 
 @dataclass
@@ -61,6 +63,14 @@ class SuperMimicConfig:
     amp: str = "bf16"
     compile: bool = True
     test_hidden_dims: tuple[int, ...] | None = None
+    stage2_enabled: bool = False
+    stage2_base_checkpoint: str = ""
+    stage2_manifest: str = ""
+    stage2_manifest_sha256: str = ""
+    stage2_fraction: float = 0.8
+    stage2_star_fraction: float = 0.25
+    stage2_star_top: float = 0.05
+    stage2_star_refresh: int = 50
 
 
 _LOG_FIELDS = (
@@ -107,6 +117,12 @@ class SuperMimicLearner:
             raise ValueError("utd must be positive")
         if cfg.test_hidden_dims is not None and not cfg.test_hidden_dims:
             raise ValueError("test_hidden_dims must be nonempty when provided")
+        if cfg.stage2_enabled and (cfg.no_critic or not 0 <= cfg.stage2_star_fraction < 1):
+            raise ValueError("stage2 requires a critic and a STAR fraction in [0, 1)")
+        if cfg.stage2_enabled and not (
+            0 < cfg.stage2_star_top <= 1 and cfg.stage2_star_refresh > 0
+        ):
+            raise ValueError("stage2 requires a top fraction in (0, 1] and positive refresh")
 
         self.env = env
         self.cfg = cfg
@@ -142,6 +158,22 @@ class SuperMimicLearner:
         self.opt_wm = torch.optim.Adam(self.wm.parameters(), lr=cfg.lr)
         self.opt_pi = torch.optim.Adam(self.pi.parameters(), lr=cfg.lr, betas=(0.9, 0.95))
         self.opt_v = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
+        self.ref_pi: Policy | None = None
+        self.stage2_ema = 0.6
+        self.stage2_lambda = 0.3
+        self.star_pool: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        self.star_fraction_actual = 0.0
+        self._last_star_sample_count = 0
+        self._star_critic_ready = False
+        self.consolidation_loss = 0.0
+        self.star_observed_completion: float | None = None
+        self.regular_observed_completion: float | None = None
+        if cfg.stage2_enabled:
+            roles = getattr(env, "stage2_acquisition_env", None)
+            if roles is None or not bool(roles.any()) or bool(roles.all()):
+                raise ValueError("stage2 requires both acquisition and consolidation environments")
+            self.acquisition_ids = roles.to(self.device).nonzero().flatten()
+            self.consolidation_ids = (~roles.to(self.device)).nonzero().flatten()
 
         self.buffer = ReplayBuffer(
             cfg.buffer_steps,
@@ -329,6 +361,18 @@ class SuperMimicLearner:
             transition = step_state.info[SUPERMIMIC_TRANSITION_KEY]
             if self._bridged:
                 transition = {key: value.to(self.device) for key, value in transition.items()}
+            if self.cfg.stage2_enabled:
+                transition["bin"] = cast(Any, self.mdp).motion.frame_bin[transition["f"]]
+                valid = self.mdp.valid_imagination_start(transition["f"], self.cfg.horizon)
+                valid &= ~transition["term"]
+                roles = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
+                roles[self.acquisition_ids] = True
+                a_count = int((valid & roles).sum())
+                c_count = int((valid & ~roles).sum())
+                if a_count + c_count:
+                    self.stage2_ema, self.stage2_lambda = consolidation_weight(
+                        a_count / (a_count + c_count), self.stage2_ema
+                    )
             self.buffer.add(transition)
             initial = unflatten_state(transition["s"])
             next_state = unflatten_state(transition["s1"])
@@ -361,28 +405,175 @@ class SuperMimicLearner:
         return loss.detach() / self.cfg.wm_window, mean_last_error
 
     def _sample_valid_starts(
-        self, batch_size: int
+        self,
+        batch_size: int,
+        env_ids: torch.Tensor | None = None,
+        star_count: int = 0,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        starts = []
-        histories = []
+        if batch_size < 1:
+            raise ValueError("imagination batch must be positive")
+        starts: list[dict[str, torch.Tensor]] = []
+        histories: list[dict[str, torch.Tensor]] = []
         count = 0
+        selected_count = 0
+        attempts = 0
         while count < batch_size:
-            start, history = self.buffer.sample_starts(2 * batch_size, self.cfg.hist)
+            attempts += 1
+            if attempts > 100:
+                raise RuntimeError("no valid imagination starts in the selected role")
+            remaining = batch_size - count
+            use_star = selected_count < star_count and self.star_pool is not None
+            if use_star:
+                pool = self.star_pool
+                assert pool is not None
+                absolute, envs, weights, saved_frames = pool
+                ages = absolute - (self.buffer.total - self.buffer.size)
+                live = (ages >= 0) & (ages < self.buffer.size)
+                if bool(live.any()):
+                    eligible = live.nonzero(as_tuple=False).flatten()
+                    rows = self.buffer._row(ages[eligible])
+                    live[eligible] = (
+                        self.buffer.data["f"][rows, envs[eligible]] == saved_frames[eligible]
+                    ) & ~self.buffer.data["done"][rows, envs[eligible]]
+                if not bool(live.any()):
+                    self.star_pool = None
+                    continue
+                picks = torch.multinomial(weights[live], 2 * remaining, replacement=True)
+                chosen = (ages[live][picks], envs[live][picks])
+                start, history = self.buffer.sample_starts(
+                    2 * remaining, self.cfg.hist, chosen=chosen
+                )
+            else:
+                start, history = self.buffer.sample_starts(
+                    2 * remaining, self.cfg.hist, env_ids=env_ids
+                )
             valid = self.mdp.valid_imagination_start(start["f"], self.cfg.horizon)
-            indices = valid.nonzero(as_tuple=False).squeeze(-1)[: batch_size - count]
+            indices = valid.nonzero(as_tuple=False).squeeze(-1)[:remaining]
+            if len(indices) == 0 and use_star:
+                self.star_pool = None
+                continue
+            if len(indices) == 0:
+                continue
             starts.append({key: value[indices] for key, value in start.items()})
             histories.append({key: value[indices] for key, value in history.items()})
             count += len(indices)
+            if use_star:
+                selected_count += len(indices)
+        self._last_star_sample_count = selected_count
 
         def concatenate(parts: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
             return {key: torch.cat([part[key] for part in parts]) for key in parts[0]}
 
         return concatenate(starts), concatenate(histories)
 
+    @torch.no_grad()
+    def _refresh_star(self) -> None:
+        self.star_pool = None
+        self.star_observed_completion = None
+        self.regular_observed_completion = None
+        if self.buffer.size < self.cfg.horizon or not self._star_critic_ready:
+            return
+        windows = self.buffer.star_windows(128, self.cfg.horizon, self.acquisition_ids)
+        shape = windows["f"].shape
+        frames = windows["f"].reshape(-1)
+        context = self.mdp.normalize_context(windows["xi"].reshape(-1, windows["xi"].shape[-1]))
+        next_frames = torch.minimum(
+            frames + 1,
+            cast(Any, self.mdp).motion.clip_end[cast(Any, self.mdp).motion.clip_id[frames]],
+        )
+        goals = self.mdp.goal(frames, self.cfg.goal_frames)
+        next_goals = self.mdp.goal(next_frames, self.cfg.goal_frames)
+        value = self.critic(
+            self._critic_input(
+                unflatten_state(windows["s"].reshape(-1, windows["s"].shape[-1])),
+                frames,
+                context,
+                goals,
+            )
+        ).reshape(shape)
+        next_value = self.critic(
+            self._critic_input(
+                unflatten_state(windows["s1"].reshape(-1, windows["s1"].shape[-1])),
+                next_frames,
+                context,
+                next_goals,
+            )
+        ).reshape(shape)
+        advantage = windows["r"] + self.cfg.gamma * (~windows["done"]) * next_value - value
+        before_done = (
+            torch.cat(
+                (
+                    torch.ones((shape[0], 1), device=self.device),
+                    (~windows["done"][:, :-1]).float(),
+                ),
+                dim=1,
+            )
+            .cumprod(dim=1)
+            .bool()
+        )
+        difficulty = cast(Any, self.env).stage2_difficulty.to(self.device)
+        selected, priorities = selected_fragments(
+            windows["bin"],
+            advantage,
+            windows["done"],
+            difficulty,
+            top_fraction=self.cfg.stage2_star_top,
+            mask=before_done,
+        )
+        selected_mask = torch.zeros_like(windows["done"])
+        if selected.numel():
+            selected_mask[selected[:, 0], selected[:, 1]] = True
+        completed = (
+            windows["done"]
+            & ~windows["term"]
+            & (
+                windows["f"] + 1
+                >= cast(Any, self.mdp).motion.clip_end[
+                    cast(Any, self.mdp).motion.clip_id[windows["f"]]
+                ]
+            )
+        )
+        # The window is truncated; these are diagnostic rates among observed
+        # terminal transitions, not estimates of full-motion success rates.
+        for pool, name in (
+            (selected_mask, "star_observed_completion"),
+            (before_done & ~selected_mask, "regular_observed_completion"),
+        ):
+            terminal = pool & windows["done"]
+            if bool(terminal.any()):
+                setattr(self, name, float(completed[terminal].float().mean()))
+        if selected.numel():
+            ages = windows["age"][selected[:, 0], selected[:, 1]]
+            envs = windows["env"][selected[:, 0], selected[:, 1]]
+            frames = windows["f"][selected[:, 0], selected[:, 1]]
+            valid = self.mdp.valid_imagination_start(frames, self.cfg.horizon)
+            if bool(valid.any()):
+                absolute = ages[valid] + (self.buffer.total - self.buffer.size)
+                self.star_pool = absolute, envs[valid], priorities[valid], frames[valid]
+
     def policy_update(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        start, history = self._sample_valid_starts(self.cfg.pi_batch)
+        star_count = int(self.cfg.pi_batch * self.cfg.stage2_star_fraction) if self.star_pool else 0
+        self.star_fraction_actual = 0.0
+        if self.cfg.stage2_enabled:
+            regular, regular_history = self._sample_valid_starts(
+                self.cfg.pi_batch - star_count, self.acquisition_ids
+            )
+            if star_count:
+                selected, selected_history = self._sample_valid_starts(
+                    star_count, self.acquisition_ids, star_count=star_count
+                )
+                start = {key: torch.cat((regular[key], selected[key])) for key in regular}
+                history = {
+                    key: torch.cat((regular_history[key], selected_history[key]))
+                    for key in regular_history
+                }
+                self.star_fraction_actual = self._last_star_sample_count / self.cfg.pi_batch
+            else:
+                start, history = regular, regular_history
+        else:
+            start, history = self._sample_valid_starts(self.cfg.pi_batch)
         state = unflatten_state(start["s"])
         context, frames, previous_action = start["xi"], start["f"], start["a_prev"]
         normalized_context = self.mdp.normalize_context(context)
@@ -445,6 +636,24 @@ class SuperMimicLearner:
                     self._critic_input_fn(state, frames, normalized_context, goal)
                 )
             loss = -objective.mean()
+            if self.ref_pi is not None:
+                master, master_history = self._sample_valid_starts(
+                    max(1, batch_size // 4), self.consolidation_ids
+                )
+                master_obs = self.mdp.obs(
+                    unflatten_state(master_history["s"]),
+                    master_history["a_prev"],
+                    master_history["xi"],
+                    master_history["f"],
+                )
+                master_goal = self.mdp.goal(master["f"], self.cfg.goal_frames)
+                with torch.no_grad():
+                    reference_action = self.ref_pi(master_obs, master_goal)
+                imitation = (
+                    (self.pi(master_obs, master_goal) - reference_action).square().sum(-1).mean()
+                )
+                self.consolidation_loss = float(imitation.detach())
+                loss = loss + self.stage2_lambda * imitation
             self.opt_pi.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(self.pi.parameters(), 1.0)
@@ -540,6 +749,10 @@ class SuperMimicLearner:
             "args": asdict(self.cfg),
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        if self.cfg.stage2_enabled:
+            checkpoint["stage2_ema"] = self.stage2_ema
+            checkpoint["stage2_base_checkpoint"] = self.cfg.stage2_base_checkpoint
+            checkpoint["stage2_manifest_sha256"] = self.cfg.stage2_manifest_sha256
         if include_optimizers:
             checkpoint.update(
                 {
@@ -570,12 +783,50 @@ class SuperMimicLearner:
         self.wm.load_state_dict(checkpoint["wm"])
         self.pi.load_state_dict(checkpoint["pi"])
         self.critic.load_state_dict(checkpoint["critic"])
+        self._star_critic_ready = True
         self.opt_wm.load_state_dict(checkpoint["opt_wm"])
         self.opt_pi.load_state_dict(checkpoint["opt_pi"])
         self.opt_v.load_state_dict(checkpoint["opt_v"])
         self.iteration = checkpoint["iteration"]
         self.wall_time = checkpoint["wall_time"]
         self.sim_steps = checkpoint["sim_steps"]
+        if self.cfg.stage2_enabled:
+            if checkpoint.get("stage2_manifest_sha256") != self.cfg.stage2_manifest_sha256:
+                raise ValueError("stage2 resume motion library identity mismatch")
+            if checkpoint.get("stage2_base_checkpoint") != self.cfg.stage2_base_checkpoint:
+                raise ValueError("stage2 resume base checkpoint mismatch")
+            self.stage2_ema = float(checkpoint.get("stage2_ema", 0.6))
+            self.stage2_lambda = min(1.0, 0.3 + 5.0 * max(0.0, self.stage2_ema - 0.6))
+            self._load_reference(self.cfg.stage2_base_checkpoint)
+
+    def _load_reference(self, path: str | Path, checkpoint: dict | None = None) -> None:
+        loaded = (
+            checkpoint
+            if checkpoint is not None
+            else torch.load(path, map_location=self.device, weights_only=True)
+        )
+        assert loaded is not None
+        self.ref_pi = deepcopy(self.pi)
+        self.ref_pi.load_state_dict(loaded["pi"])
+        self.ref_pi.eval()
+        _set_requires_grad(self.ref_pi, False)
+
+    def initialize_from(self, path: str | Path) -> None:
+        """Transfer weights and normalizers, but not run counters or optimizer moments."""
+        if not self.cfg.stage2_enabled:
+            raise ValueError("base checkpoint initialization is reserved for stage2")
+        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        self.wm.load_state_dict(checkpoint["wm"])
+        self.pi.load_state_dict(checkpoint["pi"])
+        critic = matching_critic(Path(path), checkpoint)
+        if critic is not None:
+            self.critic.load_state_dict(critic)
+            self._star_critic_ready = True
+        else:
+            print(
+                "[stage2] no matching critic: start with a fresh critic; STAR waits for its first update"
+            )
+        self._load_reference(path, checkpoint)
 
     @staticmethod
     def _mean(values: list[torch.Tensor]) -> float:
@@ -639,6 +890,12 @@ class SuperMimicLearner:
                     wm_error = torch.zeros((), device=self.device)
                     for _ in range(self.cfg.wm_batches):
                         wm_loss, wm_error = self.wm_update()
+                    if (
+                        self.cfg.stage2_enabled
+                        and iteration >= self.cfg.wm_only_iters
+                        and iteration % self.cfg.stage2_star_refresh == 0
+                    ):
+                        self._refresh_star()
                     aggregate["wm"].append(wm_loss)
                     aggregate["wm8"].append(wm_error)
                     pi_loss: float | None = None
@@ -652,6 +909,7 @@ class SuperMimicLearner:
                         )
                         aggregate["pi"].append(policy_loss)
                         aggregate["v"].append(value_loss)
+                        self._star_critic_ready = True
                         aggregate["ir"].append(imagined_reward)
                         aggregate["gn"].append(grad_norm)
                         aggregate["surv"].append(survival)
@@ -696,6 +954,28 @@ class SuperMimicLearner:
                     )
 
                     if self.iteration % self.cfg.log_every == 0:
+                        if self.cfg.stage2_enabled:
+                            with (self.log_dir / "stage2_metrics.jsonl").open(
+                                "a", encoding="utf-8"
+                            ) as metrics:
+                                metrics.write(
+                                    json.dumps(
+                                        {
+                                            "iteration": self.iteration,
+                                            "valid_acquisition_ema": self.stage2_ema,
+                                            "consolidation_weight": self.stage2_lambda,
+                                            "consolidation_loss": self.consolidation_loss,
+                                            "star_fraction": self.star_fraction_actual,
+                                            "normal_fraction": 1.0 - self.star_fraction_actual,
+                                            "star_observed_completion": self.star_observed_completion,
+                                            "regular_observed_completion": self.regular_observed_completion,
+                                            "star_pool_size": 0
+                                            if self.star_pool is None
+                                            else len(self.star_pool[0]),
+                                        }
+                                    )
+                                    + "\n"
+                                )
                         iterations_per_second = self.cfg.log_every / (time.time() - log_start)
                         log_start = time.time()
                         term_frac = float(

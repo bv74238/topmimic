@@ -56,6 +56,23 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
     def supermimic_mdp(self) -> SuperMimicMdpProtocol:
         return self._supermimic_command.mdp
 
+    @property
+    def stage2_acquisition_env(self) -> torch.Tensor:
+        return self._supermimic_command.acquisition_env
+
+    @property
+    def stage2_difficulty(self) -> torch.Tensor:
+        from .manager_terms import start_bin_probabilities
+
+        command = self._supermimic_command
+        bins = command.role_bins[True]
+        probabilities = start_bin_probabilities(
+            command.bin_G[bins], command.bin_w_avg[bins].clone(), command.gamma
+        )
+        weights = torch.zeros_like(command.bin_G)
+        weights[bins] = probabilities / probabilities.sum() * len(bins)
+        return weights
+
     def apply_action(self, actions: torch.Tensor, state: TorchEnvState) -> torch.Tensor:
         command = self._supermimic_command
         self._pre_action = {

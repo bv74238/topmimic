@@ -18,3 +18,23 @@ outputs/
 *.pt
 src/unisupermimic/assets/robots/g1/assets/
 src/unisupermimic/assets/motions/
+
+# Local/remote virtual environments (also ignore a .venv symlink).
+.venv
+venv/
+env/
+.conda/
+# Model weights, training artifacts and local asset archives stay out of Git.
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.log
+# Local secrets must never be committed.
+.env
+.env.*
+!.env.example

@@ -254,7 +254,29 @@ def watch(
         time.sleep(poll_seconds)
 
 
-def make_eval_env(run_dir: Path, backend: str = "mjwarp") -> SuperMimicManagerBasedRlEnv:
+def _resolve_custom_motion_files(motion_files: list[Path]) -> list[Path]:
+    resolved_files = [Path(path).expanduser().resolve() for path in motion_files]
+    if not resolved_files:
+        raise ValueError("motion_files must contain at least one CSV path")
+    missing = [path for path in resolved_files if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("Motion CSV file(s) not found: " + ", ".join(map(str, missing)))
+    if any(path.suffix.lower() != ".csv" for path in resolved_files):
+        raise ValueError("Custom motion files must use the .csv extension")
+    names = [path.stem for path in resolved_files]
+    if len(names) != len(set(names)):
+        raise ValueError("Custom motion CSV files must have unique basenames")
+    return resolved_files
+
+
+def make_eval_env(
+    run_dir: Path,
+    backend: str = "mjwarp",
+    motion_files: list[Path] | None = None,
+    *,
+    random_initial: bool = False,
+    seed: int = 0,
+) -> SuperMimicManagerBasedRlEnv:
     from hydra import compose, initialize_config_dir
     from unilab.base.config_adapter import create_env
     from unilab.base.process_device import configure_backend_process_device
@@ -269,13 +291,28 @@ def make_eval_env(run_dir: Path, backend: str = "mjwarp") -> SuperMimicManagerBa
     overrides = ["training.play_only=true", f"task=g1_super_mimic/{backend}"]
     with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
         cfg = compose(config_name="config", overrides=overrides)
+    snapshot_path = run_dir / "run_config.json"
+    if snapshot_path.is_file():
+        recorded = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        if recorded.get("config", {}).get("algo", {}).get("stage2_enabled"):
+            cfg.env.commands.motion.motion_files = recorded["config"]["env"]["commands"]["motion"][
+                "motion_files"
+            ]
     ensure_registries()
+    # Validate the checkpoint against the canonical training assets first. A custom
+    # reference is an inference-time input, not a change to the trained policy
+    # contract, so replace only the motion list after strict validation succeeds.
     resolve_sim2sim_config(
         run_dir,
         cfg,
         algo_name="supermimic",
         strict=bool(cfg.training.sim2sim_strict),
     )
+    if motion_files is not None:
+        resolved_files = _resolve_custom_motion_files(motion_files)
+        cfg.env.commands.motion.motion_files = [str(path) for path in resolved_files]
+    cfg.env.commands.motion.eval_initial_noise = random_initial
+    cfg.env.seed = seed
     device = get_default_device()
     bound_device = configure_backend_process_device(str(cfg.training.sim_backend), device)
     if bound_device is not None:
@@ -297,6 +334,15 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backend", choices=SUPPORTED_BACKENDS, default="mjwarp", help="Simulation backend"
     )
+    parser.add_argument(
+        "--motion",
+        type=Path,
+        action="append",
+        help="Custom G1 reference-motion CSV (repeat for multiple clips; requires --ckpt)",
+    )
+    parser.add_argument(
+        "--output", type=Path, help="Save the full evaluation JSON report (requires --ckpt)"
+    )
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--every", type=int, default=1)
     parser.add_argument("--poll_seconds", type=float, default=60.0)
@@ -307,11 +353,14 @@ def _argument_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     from unisupermimic.sim2sim import policy_load_dim_guard
 
-    args = _argument_parser().parse_args(argv)
+    parser = _argument_parser()
+    args = parser.parse_args(argv)
     if args.ckpt is None and args.run_dir is None:
-        _argument_parser().error("one of --run_dir or --ckpt is required")
+        parser.error("one of --run_dir or --ckpt is required")
+    if (args.motion is not None or args.output is not None) and args.ckpt is None:
+        parser.error("--motion and --output require --ckpt (not checkpoint watching)")
     run_dir = args.ckpt.parent if args.ckpt is not None else args.run_dir
-    env = make_eval_env(run_dir, backend=args.backend)
+    env = make_eval_env(run_dir, backend=args.backend, motion_files=args.motion)
     try:
         if args.ckpt is not None:
             device = torch.device(env.device)
@@ -322,6 +371,10 @@ def main(argv: list[str] | None = None) -> None:
                 algo_name="supermimic",
             ):
                 result = evaluate(env, checkpoint, device=device)
+            if args.output is not None:
+                output = args.output.expanduser()
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
             print(
                 json.dumps(
                     {key: value for key, value in result.items() if key != "per_clip"}, indent=1

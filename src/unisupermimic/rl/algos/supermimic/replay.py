@@ -43,12 +43,20 @@ class ReplayBuffer:
         for key, (shape, dtype) in self.fields.items():
             field_shape = (T, N) + ((shape,) if isinstance(shape, int) else shape)
             self.data[key] = torch.zeros(field_shape, dtype=dtype, device=self.device)
+        self.bin = torch.zeros((T, N), dtype=torch.long, device=self.device)
+        self.term = torch.zeros((T, N), dtype=torch.bool, device=self.device)
         self.ptr = 0
         self.size = 0
+        self.total = 0
 
     def add(self, transition: dict[str, torch.Tensor]) -> None:
         for key in self.fields:
             self.data[key][self.ptr] = transition[key]
+        if "bin" in transition:
+            self.bin[self.ptr] = transition["bin"]
+        if "term" in transition:
+            self.term[self.ptr] = transition["term"]
+        self.total += 1
         self.ptr = (self.ptr + 1) % self.T
         self.size = min(self.size + 1, self.T)
 
@@ -78,14 +86,24 @@ class ReplayBuffer:
         self,
         B: int,
         hist: int,
+        env_ids: torch.Tensor | None = None,
+        chosen: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """Sample imagination starts and oldest-first, boundary-padded histories."""
         if self.size == 0:
             raise ValueError("cannot sample from an empty replay buffer")
         if hist < 1:
             raise ValueError(f"history length must be positive, got {hist}")
-        age = torch.randint(0, self.size, (B,), device=self.device)
-        env = torch.randint(0, self.N, (B,), device=self.device)
+        if chosen is None:
+            age = torch.randint(0, self.size, (B,), device=self.device)
+            if env_ids is None:
+                env = torch.randint(0, self.N, (B,), device=self.device)
+            else:
+                env = env_ids[torch.randint(0, len(env_ids), (B,), device=self.device)]
+        else:
+            age, env = chosen
+            if age.shape != (B,) or env.shape != (B,):
+                raise ValueError("chosen replay coordinates must match batch size")
         row = self._row(age)
         ep_step = self.data["ep_step"][row, env].long()
         back = torch.arange(hist - 1, -1, -1, device=self.device)
@@ -98,6 +116,28 @@ class ReplayBuffer:
             key: self.data[key][history_rows, history_envs] for key in ("s", "a_prev", "xi", "f")
         }
         return start, history
+
+    def star_windows(self, B: int, k: int, env_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Draw contiguous real rollout windows with age and episode masks."""
+        if k > self.size:
+            raise ValueError("not enough transitions for STAR windows")
+        start = torch.randint(0, self.size - k + 1, (B,), device=self.device)
+        env = env_ids[torch.randint(0, len(env_ids), (B,), device=self.device)]
+        ages = start[:, None] + torch.arange(k, device=self.device)
+        envs = env[:, None].expand_as(ages)
+        rows = self._row(ages)
+        return {
+            "age": ages,
+            "env": envs,
+            "s": self.data["s"][rows, envs],
+            "s1": self.data["s1"][rows, envs],
+            "xi": self.data["xi"][rows, envs],
+            "f": self.data["f"][rows, envs],
+            "r": self.data["r"][rows, envs],
+            "done": self.data["done"][rows, envs],
+            "term": self.term[rows, envs],
+            "bin": self.bin[rows, envs],
+        }
 
 
 __all__ = ["FIELDS", "ReplayBuffer"]

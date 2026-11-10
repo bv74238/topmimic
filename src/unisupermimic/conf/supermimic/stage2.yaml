@@ -1,0 +1,15 @@
+# Independent second-stage run; supply checkpoint and manifest on the command line.
+defaults:
+  - config
+  - _self_
+
+algo:
+  stage2_enabled: true
+  resume: false
+  wm_only_iters: 0
+  iterations: 6000
+  lr_decay_iters: 6000
+  stage2_fraction: 0.8
+  stage2_star_fraction: 0.25
+  stage2_star_top: 0.05
+  stage2_star_refresh: 50

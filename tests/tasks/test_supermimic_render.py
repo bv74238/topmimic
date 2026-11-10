@@ -131,3 +131,18 @@ def test_video_parser_accepts_backend(backend: str) -> None:
     args = render._argument_parser().parse_args(["--ckpt", "run/ckpt.pt", "--backend", backend])
 
     assert args.backend == backend
+
+
+def test_video_parser_accepts_custom_motion_and_optional_clip() -> None:
+    args = render._argument_parser().parse_args(
+        ["--ckpt", "run/ckpt.pt", "--motion", "/tmp/tennis_g1.csv"]
+    )
+
+    assert args.motion == [Path("/tmp/tennis_g1.csv")]
+    assert args.clip is None
+
+
+def test_video_output_defaults_to_project_video_directory() -> None:
+    args = render._argument_parser().parse_args(["--ckpt", "run/ckpt.pt"])
+
+    assert args.output == Path("outputs/videos/supermimic_comparison.mp4")

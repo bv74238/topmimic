@@ -59,10 +59,27 @@ def sample_start_frames(
     gamma: float,
     num_samples: int,
     rng: ManagerRng,
+    eligible_bins: torch.Tensor | None = None,
+    adaptive: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sample one-second bins and uniformly sample a frame inside each bin."""
-    probabilities = start_bin_probabilities(bin_G, bin_w_avg, gamma)
-    bins = rng.choice(motion.num_bins, (num_samples,), p=probabilities)
+    if eligible_bins is None:
+        eligible_bins = torch.arange(motion.num_bins, device=bin_G.device)
+    if adaptive:
+        if len(eligible_bins) == motion.num_bins:
+            probabilities = start_bin_probabilities(bin_G, bin_w_avg, gamma)[eligible_bins]
+        else:
+            # Stage II must compute the adaptive distribution within its own
+            # role: mastered bins must not change difficult-bin probabilities.
+            role_average = bin_w_avg[eligible_bins].clone()
+            probabilities = start_bin_probabilities(bin_G[eligible_bins], role_average, gamma)
+            bin_w_avg[eligible_bins] = role_average
+        probabilities = probabilities / probabilities.sum()
+    else:
+        probabilities = torch.full(
+            (len(eligible_bins),), 1.0 / len(eligible_bins), device=motion.device
+        )
+    bins = eligible_bins[rng.choice(len(eligible_bins), (num_samples,), p=probabilities)]
     start = motion.bin_start[bins]
     end = torch.minimum(start + BIN_FRAMES, motion.clip_end[motion.bin_clip[bins]])
     frames = start + (rng.random((num_samples,)) * (end - start).float()).long()
@@ -174,6 +191,9 @@ class SuperMimicCommandCfg(CommandTermCfg):
     motion_files: list[str]
     mjcf_path: str
     eval_mode: bool = False
+    eval_initial_noise: bool = False
+    motion_roles: list[str] | None = None
+    acquisition_fraction: float = 0.8
     gamma: float = 0.99
     src_fps: float = 30.0
     reset_noise: bool = True
@@ -209,7 +229,7 @@ class SuperMimicCommand(CommandTerm):
         self.mdp = MDP(self.kin, self.motion, self.default_q[0].clone())
         self.gamma = float(cfg.gamma)
         self.eval_mode = cfg.eval_mode
-        self.reset_noise = cfg.reset_noise and not cfg.eval_mode
+        self.reset_noise = cfg.reset_noise and (not cfg.eval_mode or cfg.eval_initial_noise)
         self.max_episode_steps = 10**9 if cfg.eval_mode else cfg.max_episode_steps
         self._env_origins = env.scene.env_origins(device)
         self.f = torch.zeros(self.num_envs, dtype=torch.int64, device=device)
@@ -223,6 +243,20 @@ class SuperMimicCommand(CommandTerm):
         self.bin_w_avg = torch.full(
             (self.motion.num_bins,), 1.0 / self.motion.num_bins, device=device
         )
+        self.acquisition_env = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+        self.role_bins: dict[bool, torch.Tensor] = {}
+        if cfg.motion_roles is not None and not cfg.eval_mode:
+            if len(cfg.motion_roles) != len(self.motion.names) or set(cfg.motion_roles) != {
+                "acquisition",
+                "consolidation",
+            }:
+                raise ValueError("motion_roles must contain one of two valid roles per clip")
+            count = min(self.num_envs - 1, max(1, round(self.num_envs * cfg.acquisition_fraction)))
+            self.acquisition_env[:count] = True
+            for role, label in ((True, "acquisition"), (False, "consolidation")):
+                ids = [index for index, value in enumerate(cfg.motion_roles) if value == label]
+                clips = torch.tensor(ids, device=device)
+                self.role_bins[role] = torch.isin(self.motion.bin_clip, clips).nonzero().flatten()
         self.last_episode_stats: dict[str, torch.Tensor] = {}
         self._requested_frames: torch.Tensor | None = None
         self._read_phase_bound = False
@@ -320,14 +354,32 @@ class SuperMimicCommand(CommandTerm):
         if ids.numel() == 0:
             return {}
         if self._requested_frames is None:
-            frames, bins = sample_start_frames(
-                self.motion,
-                self.bin_G,
-                self.bin_w_avg,
-                self.gamma,
-                ids.numel(),
-                self._rng,
-            )
+            frames = torch.empty_like(ids)
+            bins = torch.empty_like(ids)
+            if not self.role_bins:
+                frames, bins = sample_start_frames(
+                    self.motion,
+                    self.bin_G,
+                    self.bin_w_avg,
+                    self.gamma,
+                    ids.numel(),
+                    self._rng,
+                )
+            else:
+                for role in (True, False):
+                    selected = self.acquisition_env[ids] == role
+                    if bool(selected.any()):
+                        sampled, sampled_bins = sample_start_frames(
+                            self.motion,
+                            self.bin_G,
+                            self.bin_w_avg,
+                            self.gamma,
+                            int(selected.sum()),
+                            self._rng,
+                            self.role_bins[role],
+                            adaptive=role,
+                        )
+                        frames[selected], bins[selected] = sampled, sampled_bins
         else:
             if not bool(reset_mask.all()):
                 raise ValueError("SuperMimic requested-frame reset must include every environment")

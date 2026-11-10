@@ -26,6 +26,7 @@ from unilab.utils.checkpoint import get_latest_run, normalize_checkpoint_value
 from unilab.utils.device import get_default_device
 
 from unisupermimic.rl.algos.supermimic.learner import SuperMimicConfig, SuperMimicLearner
+from unisupermimic.rl.algos.supermimic.stage2 import manifest_identity, read_manifest
 from unisupermimic.sim2sim import (
     extract_contract_snapshot,
     policy_load_dim_guard,
@@ -63,7 +64,7 @@ def build_env_override(
     commands = dict(override["commands"])
     motion = dict(commands["motion"])
     motion["eval_mode"] = True
-    motion["reset_noise"] = False
+    motion["reset_noise"] = bool(motion.get("eval_initial_noise", False))
     commands["motion"] = motion
     override["commands"] = commands
     override["auto_reset"] = True
@@ -115,6 +116,28 @@ def _close_env(env: Any) -> None:
 
 
 def main(cfg: DictConfig) -> None:
+    if bool(cfg.algo.stage2_enabled):
+        if bool(cfg.training.play_only):
+            raise ValueError("evaluate stage2 checkpoints with unisupermimic-pace instead")
+        if not cfg.algo.stage2_manifest or not cfg.algo.stage2_base_checkpoint:
+            raise ValueError("stage2 requires a manifest and a base checkpoint")
+        if int(cfg.algo.num_envs) < 2:
+            raise ValueError("stage2 requires at least two environments")
+        cfg.algo.stage2_base_checkpoint = str(
+            Path(str(cfg.algo.stage2_base_checkpoint)).expanduser().resolve()
+        )
+        cfg.algo.stage2_manifest = str(Path(str(cfg.algo.stage2_manifest)).expanduser().resolve())
+        manifest = read_manifest(str(cfg.algo.stage2_manifest))
+        if Path(manifest["base_checkpoint"]).resolve() != Path(
+            str(cfg.algo.stage2_base_checkpoint)
+        ):
+            raise ValueError("stage2 base checkpoint must match the grouping checkpoint")
+        cfg.algo.stage2_manifest_sha256 = manifest_identity(manifest)
+        cfg.env.commands.motion.motion_files = [clip["path"] for clip in manifest["clips"]]
+        cfg.env.commands.motion.motion_roles = [clip["role"] for clip in manifest["clips"]]
+        cfg.env.commands.motion.acquisition_fraction = float(cfg.algo.stage2_fraction)
+        if not 0 < cfg.algo.stage2_fraction < 1:
+            raise ValueError("stage2_fraction must be between zero and one")
     ensure_registries()
     if float(cfg.algo.gamma) != float(cfg.env.commands.motion.gamma):
         raise ValueError("SuperMimic requires algo.gamma == env.commands.motion.gamma")
@@ -187,6 +210,8 @@ def main(cfg: DictConfig) -> None:
             device=str(device),
             backend=str(cfg.training.sim_backend),
         )
+        if cfg.algo.stage2_enabled and checkpoint is None:
+            learner.initialize_from(str(cfg.algo.stage2_base_checkpoint))
         summary = learner.train(resume=checkpoint)
         print(json.dumps(summary, indent=2))
     finally:
